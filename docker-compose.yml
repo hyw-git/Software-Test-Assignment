@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aitest-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-aitest}
+      POSTGRES_USER: ${POSTGRES_USER:-aitest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aitest123}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aitest} -d ${POSTGRES_DB:-aitest}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: aitest-ai-service
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      APP_PORT: ${AI_SERVICE_PORT:-8000}
+    ports:
+      - "${AI_SERVICE_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aitest-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+    environment:
+      PORT: ${BACKEND_PORT:-3000}
+      DATABASE_URL: postgres://${POSTGRES_USER:-aitest}:${POSTGRES_PASSWORD:-aitest123}@postgres:5432/${POSTGRES_DB:-aitest}
+      AI_SERVICE_URL: http://ai-service:8000
+      TEST_TECHNIQUE: ${TEST_TECHNIQUE:-black-box}
+    ports:
+      - "${BACKEND_PORT:-3000}:3000"
+
+volumes:
+  postgres_data:
