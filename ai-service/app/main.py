@@ -1,16 +1,24 @@
 import json
 import os
 import re
+import time
+from io import BytesIO
 from typing import Any, Dict, List
 
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 try:
     from openai import OpenAI
 except Exception:  # pragma: no cover
     OpenAI = None
+
+from app.engines.pipeline import merge_engine_with_llm, run_deterministic_pipeline
+from app.engines.risk_engine import export_risk_matrix
+from app.engines.schema_validator import validate_llm_payload
+from app.export_xlsx import build_xlsx_bytes
 
 app = FastAPI(title="AI Testcase Service")
 
@@ -56,6 +64,8 @@ class TestArtifacts(BaseModel):
     stateModel: Dict[str, Any] = Field(default_factory=dict)
     testSuiteOptimization: Dict[str, Any] = Field(default_factory=dict)
     traceability: List[Dict[str, Any]] = Field(default_factory=list)
+    testStrategies: List[Dict[str, Any]] = Field(default_factory=list)
+    engineMetadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class GenerateResponse(BaseModel):
@@ -66,6 +76,8 @@ class GenerateResponse(BaseModel):
     llmRawOutput: str
     artifacts: TestArtifacts
     testcases: List[TestCase]
+    engineMetadata: Dict[str, Any] = Field(default_factory=dict)
+    timingMetrics: Dict[str, Any] = Field(default_factory=dict)
 
 
 @app.get("/health")
@@ -81,7 +93,7 @@ ALLOWED_METHODS = [
     "DecisionTable",
 ]
 
-PROMPT_VERSION = "autotestdesign-v4-fitnessai-assignment"
+PROMPT_VERSION = "autotestdesign-v6-fr-complete"
 ENABLE_PARSE_FALLBACK = os.getenv("ENABLE_PARSE_FALLBACK", "false").strip().lower() == "true"
 
 TARGET_APP_CONTEXT = (
@@ -652,6 +664,8 @@ def _normalize_artifacts(payload) -> TestArtifacts:
         stateModel=payload.get("stateModel", {}) if isinstance(payload.get("stateModel", {}), dict) else {},
         testSuiteOptimization=payload.get("testSuiteOptimization", {}) if isinstance(payload.get("testSuiteOptimization", {}), dict) else {},
         traceability=_normalize_traceability(_safe_list("traceability")),
+        testStrategies=_safe_list("testStrategies"),
+        engineMetadata=payload.get("engineMetadata", {}) if isinstance(payload.get("engineMetadata", {}), dict) else {},
     )
 
 
@@ -670,6 +684,7 @@ def _has_artifact_content(artifacts: TestArtifacts) -> bool:
             artifacts.stateModel,
             artifacts.testSuiteOptimization,
             artifacts.traceability,
+            artifacts.testStrategies,
         ]
     )
 
@@ -1083,17 +1098,123 @@ def _cases_to_markdown(cases: List[TestCase]) -> str:
     return "\n".join(lines)
 
 
-def _mock_response(source_type: str, merged_content: str, reason: str = "mock-fallback") -> GenerateResponse:
-    mock_cases = _mock_cases(source_type, merged_content)
+def _finalize_generation(
+    source_type: str,
+    merged_content: str,
+    model: str,
+    prompt_used: str,
+    llm_raw: str,
+    llm_artifacts: Dict[str, Any],
+    llm_cases: List[TestCase],
+    include_whitebox: bool,
+    include_oracle: bool,
+    include_optimization: bool,
+    coverage_criterion: str,
+    whitebox_description: str = "",
+    llm_ms: int = 0,
+    llm_validation: Dict[str, Any] | None = None,
+) -> GenerateResponse:
+    engine = run_deterministic_pipeline(
+        merged_content,
+        include_whitebox=include_whitebox,
+        include_oracle=include_oracle,
+        include_optimization=include_optimization,
+        coverage_criterion=coverage_criterion,
+        whitebox_description=whitebox_description,
+    )
+    llm_artifact_dict = llm_artifacts if isinstance(llm_artifacts, dict) else {}
+    llm_case_dicts = [item.model_dump() if hasattr(item, "model_dump") else dict(item) for item in llm_cases]
+    merged_artifacts, merged_case_dicts = merge_engine_with_llm(engine, llm_artifact_dict, llm_case_dicts)
+    merged_cases = _normalize_cases(merged_case_dicts, source_type)
+    meta = merged_artifacts.get("engineMetadata", engine.get("engineMetadata", {}))
+    if llm_validation:
+        meta["llmValidation"] = llm_validation
+    merged_artifacts["engineMetadata"] = meta
+    engine_ms = int(meta.get("engineMs") or engine.get("timingMetrics", {}).get("engineMs") or 0)
+    total_ms = engine_ms + int(llm_ms or 0)
+    timing = {
+        "engineMs": engine_ms,
+        "llmMs": int(llm_ms or 0),
+        "totalMs": total_ms,
+        "engineMeetsNfr": engine_ms <= 2000,
+        "note": "NFR target 2s applies to deterministic engine; LLM adds variable latency.",
+    }
+    merged_artifacts["timingMetrics"] = timing
+    artifacts = _normalize_artifacts(merged_artifacts)
+    if include_oracle:
+        from app.engines.oracle_engine import attach_oracles
+
+        case_dicts = [c.model_dump() for c in merged_cases]
+        enriched = attach_oracles(case_dicts, merged_artifacts.get("requirementsStructured", []))
+        merged_cases = _normalize_cases(enriched, source_type)
+
     return GenerateResponse(
-        model="mock",
+        model=model,
         testTechnique="black-box",
         promptVersion=PROMPT_VERSION,
-        promptUsed=reason,
-        llmRawOutput=_cases_to_markdown(mock_cases),
-        artifacts=_mock_artifacts(merged_content),
-        testcases=mock_cases,
+        promptUsed=prompt_used,
+        llmRawOutput=llm_raw or _cases_to_markdown(merged_cases),
+        artifacts=artifacts,
+        testcases=merged_cases,
+        engineMetadata=meta,
+        timingMetrics=timing,
     )
+
+
+def _mock_response(
+    source_type: str,
+    merged_content: str,
+    reason: str = "mock-fallback",
+    req: GenerateRequest | None = None,
+) -> GenerateResponse:
+    mock_cases = _mock_cases(source_type, merged_content)
+    mock_artifacts = _mock_artifacts(merged_content)
+    artifact_dict = mock_artifacts.model_dump() if hasattr(mock_artifacts, "model_dump") else {}
+    include_whitebox = bool(req.includeWhitebox) if req is not None else True
+    include_oracle = bool(req.includeOracle) if req is not None else True
+    include_optimization = bool(req.includeOptimization) if req is not None else True
+    coverage = str(req.coverageCriterion if req else "all-states")
+    wb = str(req.whiteboxDescription if req else "")
+    return _finalize_generation(
+        source_type,
+        merged_content,
+        "mock+engine",
+        reason,
+        _cases_to_markdown(mock_cases),
+        artifact_dict,
+        mock_cases,
+        include_whitebox,
+        include_oracle,
+        include_optimization,
+        coverage,
+        wb,
+        0,
+        {"passed": True, "source": "mock"},
+    )
+
+
+@app.get("/api/risk-matrix")
+def risk_matrix():
+    return {"message": "Configurable risk matrix for FR 2.0", "matrix": export_risk_matrix()}
+
+
+class ExportArtifactsRequest(BaseModel):
+    format: str = "json"
+    artifacts: Dict[str, Any] = Field(default_factory=dict)
+    testcases: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@app.post("/export-artifacts")
+def export_artifacts(req: ExportArtifactsRequest):
+    fmt = str(req.format or "json").lower()
+    if fmt in ("xlsx", "excel"):
+        data = build_xlsx_bytes(req.artifacts, req.testcases)
+        return Response(
+            content=data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=autotestdesign-artifacts.xlsx"},
+        )
+    return {"message": "Artifacts export", "artifacts": req.artifacts, "testcases": req.testcases}
 
 
 @app.get("/prompt-template")
@@ -1108,12 +1229,16 @@ def prompt_template():
 @app.post("/generate-testcases", response_model=GenerateResponse)
 def generate_testcases(req: GenerateRequest):
     merged_content = _compose_content(req.content, req.documents)
+    include_whitebox = bool(req.includeWhitebox)
+    include_oracle = bool(req.includeOracle)
+    include_optimization = bool(req.includeOptimization)
+    coverage_criterion = str(req.coverageCriterion or "all-states")
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     model = os.getenv("OPENAI_MODEL", "deepseek-chat").strip()
 
     if not api_key or OpenAI is None:
-        return _mock_response(req.sourceType, merged_content, "mock-fallback:no-api-key")
+        return _mock_response(req.sourceType, merged_content, "mock-fallback:no-api-key", req)
 
     base_url = os.getenv("OPENAI_BASE_URL", "").strip()
     if base_url:
@@ -1137,51 +1262,47 @@ def generate_testcases(req: GenerateRequest):
             f"- coverageCriterion: {str(req.coverageCriterion)}\n"
         )
 
+    llm_started = time.perf_counter()
     try:
         response = _call_llm(client, model, prompt)
         text = _extract_response_text(response)
     except Exception as error:
         if os.getenv("DISABLE_LLM_FAILURE_FALLBACK", "false").strip().lower() != "true":
-            return _mock_response(req.sourceType, merged_content, f"mock-fallback:llm-request-failed:{error}")
+            return _mock_response(req.sourceType, merged_content, f"mock-fallback:llm-request-failed:{error}", req)
         raise HTTPException(status_code=502, detail=f"LLM request failed: {error}")
 
     if not text:
         if os.getenv("DISABLE_LLM_FAILURE_FALLBACK", "false").strip().lower() != "true":
-            return _mock_response(req.sourceType, merged_content, "mock-fallback:llm-empty-content")
+            return _mock_response(req.sourceType, merged_content, "mock-fallback:llm-empty-content", req)
         raise HTTPException(status_code=502, detail="LLM returned empty content")
 
-    payload = _extract_json_object(text)
-    cases = _normalize_cases((payload or {}).get("testcases", []), req.sourceType)
+    llm_ms = int((time.perf_counter() - llm_started) * 1000)
+    payload = _extract_json_object(text) or {}
+    llm_valid, llm_issues = validate_llm_payload(payload if isinstance(payload, dict) else {})
+    llm_validation = {"passed": llm_valid, "issues": llm_issues, "source": "schema_validator"}
+    cases = _normalize_cases(payload.get("testcases", []), req.sourceType)
     artifacts = _normalize_artifacts(payload)
-    if not cases:
-        if ENABLE_PARSE_FALLBACK:
-            cases = _mock_cases(req.sourceType, merged_content)
-        # When fallback is disabled, keep markdown output and return empty cases.
-        # This avoids request failure caused by strict JSON parsing.
-    if not _has_artifact_content(artifacts):
-        artifacts = _mock_artifacts(merged_content) if ENABLE_PARSE_FALLBACK else TestArtifacts(
-            inputVariables=[],
-            equivalencePartitions=[],
-            boundaryValues=[],
-            decisionTableRules=[],
-            missingItems=[],
-            assumptions=[],
-            requirementsStructured=[],
-            coverageItems=[],
-            riskItems=[],
-            stateModel={},
-            testSuiteOptimization={},
-            traceability=[],
-        )
+    if not cases and ENABLE_PARSE_FALLBACK:
+        cases = _mock_cases(req.sourceType, merged_content)
+    artifact_dict = artifacts.model_dump() if hasattr(artifacts, "model_dump") else {}
+    if not _has_artifact_content(artifacts) and ENABLE_PARSE_FALLBACK:
+        artifact_dict = _mock_artifacts(merged_content).model_dump()
 
     rendered_raw = _cases_to_markdown(cases) if ENABLE_PARSE_FALLBACK and not _extract_json_object(text) else text
 
-    return GenerateResponse(
-        model=model,
-        testTechnique=req.testTechnique or "black-box",
-        promptVersion=PROMPT_VERSION,
-        promptUsed=prompt,
-        llmRawOutput=rendered_raw,
-        artifacts=artifacts,
-        testcases=cases,
+    return _finalize_generation(
+        req.sourceType,
+        merged_content,
+        model,
+        prompt,
+        rendered_raw,
+        artifact_dict,
+        cases,
+        include_whitebox,
+        include_oracle,
+        include_optimization,
+        coverage_criterion,
+        str(req.whiteboxDescription or ""),
+        llm_ms,
+        llm_validation,
     )

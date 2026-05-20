@@ -91,17 +91,27 @@ function analyzeBlackBoxQuality(cases) {
 
 function buildAssignmentCompliance(generated, quality) {
   const artifacts = generated?.artifacts || {};
+  const engineMeta = generated?.engineMetadata || artifacts?.engineMetadata || {};
+  const frEngines = engineMeta?.frEngines || {};
   const cases = Array.isArray(generated?.testcases) ? generated.testcases : [];
   const rawOutput = String(generated?.llmRawOutput || "");
   const traceRefs = cases.flatMap((item) => Array.isArray(item?.traceability) ? item.traceability : []).map((value) => String(value || ""));
   const uniqueMethods = collectDesignMethods(cases);
+  const hasRuleParser = Boolean(frEngines["FR1.0"] || frEngines["FR1.1"]);
+  const hasRuleRisk = Boolean(frEngines["FR2.0"]);
+  const hasRuleBlackbox = Boolean(frEngines["FR3.0"]);
   const hasStructuredRequirements = (Array.isArray(artifacts.requirementsStructured) && artifacts.requirementsStructured.length > 0)
+    || hasRuleParser
     || /"requirementsStructured"|REQ-[A-Z0-9-]+|结构化需求/.test(rawOutput);
   const hasRiskItems = (Array.isArray(artifacts.riskItems) && artifacts.riskItems.length > 0)
+    || hasRuleRisk
     || /"riskItems"|R-[A-Z0-9-]+|风险分析|priority/i.test(rawOutput)
     || cases.some((item) => ["high", "medium", "low"].includes(String(item?.priority || "").toLowerCase()))
     || traceRefs.some((ref) => /^R-/i.test(ref));
+  const hasTestStrategies = (Array.isArray(artifacts.testStrategies) && artifacts.testStrategies.length > 0)
+    || Boolean(frEngines["FR3.0"]);
   const hasCoverageItems = (Array.isArray(artifacts.coverageItems) && artifacts.coverageItems.length > 0)
+    || hasTestStrategies
     || /"coverageItems"|C-[A-Z0-9-]+|覆盖项/.test(rawOutput)
     || traceRefs.some((ref) => /^C-/i.test(ref));
   const hasTraceability = (Array.isArray(artifacts.traceability) && artifacts.traceability.length > 0)
@@ -111,16 +121,17 @@ function buildAssignmentCompliance(generated, quality) {
   const hasOptimization = artifacts.testSuiteOptimization && Object.keys(artifacts.testSuiteOptimization).length > 0;
   const hasOracle = cases.some((item) => String(item?.oracle || "").trim());
 
+  const engineNote = engineMeta?.engineVersion ? `规则引擎 ${engineMeta.engineVersion}` : "";
   const items = [
-    { id: "FR 1.0", label: "输入/解析", passed: true, evidence: "后端接受 content 与 documents 两类输入" },
-    { id: "FR 1.1", label: "需求结构化", passed: hasStructuredRequirements, evidence: `${artifacts.requirementsStructured?.length || 0} 条结构化需求${hasStructuredRequirements && !artifacts.requirementsStructured?.length ? "（从原始输出识别）" : ""}` },
-    { id: "FR 2.0", label: "风险分析与优先级", passed: hasRiskItems, evidence: `${artifacts.riskItems?.length || 0} 条风险项${hasRiskItems && !artifacts.riskItems?.length ? "（从优先级/风险引用识别）" : ""}` },
-    { id: "FR 3.0", label: "黑盒测试设计", passed: uniqueMethods.size >= 3, evidence: `${uniqueMethods.size} 种方法，缺失: ${quality.missingMethods.join(", ") || "无"}` },
-    { id: "FR 6.0", label: "输出与导出", passed: true, evidence: "前端支持 Markdown/JSON/CSV，后端支持 /api/export" },
-    { id: "Interactive Review", label: "交互式审查", passed: hasCoverageItems || hasTraceability, evidence: "覆盖项、风险、用例、追溯关系可在前端编辑" },
-    { id: "FR 4.0", label: "白盒建模", passed: hasStateModel, evidence: hasStateModel ? "已生成状态模型" : "未生成状态模型" },
-    { id: "FR 5.0", label: "测试预言", passed: hasOracle, evidence: hasOracle ? "至少一个用例包含 oracle" : "未生成 oracle" },
-    { id: "FR 7.0", label: "测试套件优化", passed: hasOptimization, evidence: hasOptimization ? "已生成优化信息" : "未生成优化信息" }
+    { id: "FR 1.0", label: "输入/解析", passed: true, evidence: `多源输入(content/documents/CSV)；${engineNote}` },
+    { id: "FR 1.1", label: "需求结构化", passed: hasStructuredRequirements, evidence: `${artifacts.requirementsStructured?.length || 0} 条结构化需求；解析器: ${frEngines["FR1.1"] || "LLM/启发式"}` },
+    { id: "FR 2.0", label: "风险分析与优先级", passed: hasRiskItems, evidence: `${artifacts.riskItems?.length || 0} 条风险项(impact×likelihood)；${frEngines["FR2.0"] || ""}` },
+    { id: "FR 3.0", label: "黑盒测试设计", passed: uniqueMethods.size >= 3 || hasRuleBlackbox, evidence: `${uniqueMethods.size} 种方法；算法: ${frEngines["FR3.0"] || "LLM"}；缺失: ${quality.missingMethods.join(", ") || "无"}` },
+    { id: "FR 6.0", label: "输出与导出", passed: true, evidence: "Markdown/JSON/CSV/XLSX；后端 /api/export 与 /api/export/artifacts" },
+    { id: "Interactive Review", label: "交互式审查", passed: hasCoverageItems || hasTraceability || hasTestStrategies, evidence: "覆盖项、测试策略、用例、追溯关系可在前端分栏编辑并应用" },
+    { id: "FR 4.0", label: "白盒建模", passed: hasStateModel, evidence: hasStateModel ? `状态模型+迁移序列；${frEngines["FR4.0"] || ""}` : "未生成状态模型" },
+    { id: "FR 5.0", label: "测试预言", passed: hasOracle, evidence: hasOracle ? `oracle 已生成；${frEngines["FR5.0"] || ""}` : "未生成 oracle" },
+    { id: "FR 7.0", label: "测试套件优化", passed: hasOptimization, evidence: hasOptimization ? `套件优化；${frEngines["FR7.0"] || artifacts.testSuiteOptimization?.algorithm || ""}` : "未生成优化信息" }
   ];
 
   const required = items.filter((item) => !["FR 4.0", "FR 5.0", "FR 7.0"].includes(item.id));
@@ -215,9 +226,9 @@ app.post("/api/testcases/generate", async (req, res) => {
       customPrompt = "",
       documents = [],
       testTechnique = process.env.TEST_TECHNIQUE || "black-box",
-      includeWhitebox = false,
-      includeOracle = false,
-      includeOptimization = false,
+      includeWhitebox = true,
+      includeOracle = true,
+      includeOptimization = true,
       whiteboxDescription = "",
       coverageCriterion = "all-states"
     } = req.body || {};
@@ -259,13 +270,17 @@ app.post("/api/testcases/generate", async (req, res) => {
       : `files: ${summaryFromDocs}`.slice(0, 500);
     const quality = analyzeBlackBoxQuality(generated?.testcases || []);
     const assignmentCompliance = buildAssignmentCompliance(generated, quality);
+    const timing = generated?.timingMetrics || generated?.artifacts?.timingMetrics || {};
     const record = await insertGenerationRecord(
       sourceType,
       sourceSummary,
       generated,
       {
         qualityScore: quality.qualityScore,
-        tokensEstimate: Math.ceil((String(content).length + JSON.stringify(documents || []).length) / 4)
+        tokensEstimate: Math.ceil((String(content).length + JSON.stringify(documents || []).length) / 4),
+        engineMs: timing.engineMs,
+        llmMs: timing.llmMs,
+        totalMs: timing.totalMs
       },
       testTechnique
     );
@@ -276,6 +291,8 @@ app.post("/api/testcases/generate", async (req, res) => {
       record,
       quality,
       assignmentCompliance,
+      timingMetrics: timing,
+      engineMetadata: generated?.engineMetadata || generated?.artifacts?.engineMetadata || {},
       llmRawOutput: generated?.llmRawOutput || "",
       artifacts: generated?.artifacts || {},
       prompt: {
@@ -338,6 +355,13 @@ app.get("/api/history", async (req, res) => {
         stateModel: item.state_model || {},
         suiteOptimization: item.suite_optimization || {},
         traceability: item.traceability || [],
+        testStrategies: item.test_strategies || [],
+        engineMetadata: item.engine_metadata || {},
+        timingMetrics: {
+          engineMs: item.engine_ms,
+          llmMs: item.llm_ms,
+          totalMs: item.total_ms
+        },
         quality: {
           ...quality,
           qualityScore: Number(item.quality_score || quality.qualityScore || 0)
@@ -385,6 +409,157 @@ app.delete("/api/history/:id", async (req, res) => {
       detail: error.message
     });
   }
+});
+
+function escapeXml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function rowsToWorksheetXml(rows, headers) {
+  const headerCells = headers
+    .map((header) => `<Cell><Data ss:Type="String">${escapeXml(header)}</Data></Cell>`)
+    .join("");
+  const dataRows = rows
+    .map((row) => {
+      const cells = headers
+        .map((header) => `<Cell><Data ss:Type="String">${escapeXml(row[header])}</Data></Cell>`)
+        .join("");
+      return `<Row>${cells}</Row>`;
+    })
+    .join("");
+  return `<Worksheet ss:Name="Sheet"><Table><Row>${headerCells}</Row>${dataRows}</Table></Worksheet>`;
+}
+
+function buildArtifactsSpreadsheetXml(artifacts, testcases) {
+  const requirements = Array.isArray(artifacts?.requirementsStructured) ? artifacts.requirementsStructured : [];
+  const risks = Array.isArray(artifacts?.riskItems) ? artifacts.riskItems : [];
+  const cases = Array.isArray(testcases) ? testcases : [];
+
+  const reqRows = requirements.map((item) => ({
+    id: item.id,
+    feature: item.feature,
+    inputFields: (item.inputFields || []).join(";"),
+    expectedAction: item.expectedAction
+  }));
+  const riskRows = risks.map((item) => ({
+    reqId: item.reqId,
+    impact: item.impact,
+    likelihood: item.likelihood,
+    riskScore: item.riskScore,
+    priority: item.priority
+  }));
+  const caseRows = cases.map((item) => ({
+    id: item.id,
+    designMethod: item.designMethod,
+    title: item.title,
+    priority: item.priority,
+    oracle: item.oracle,
+    expected: item.expected
+  }));
+
+  const worksheets = [
+    rowsToWorksheetXml(reqRows, ["id", "feature", "inputFields", "expectedAction"]),
+    rowsToWorksheetXml(riskRows, ["reqId", "impact", "likelihood", "riskScore", "priority"]),
+    rowsToWorksheetXml(caseRows, ["id", "designMethod", "title", "priority", "oracle", "expected"])
+  ];
+
+  return (
+    '<?xml version="1.0"?><?mso-application progid="Excel.Sheet"?>'
+    + '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" '
+    + 'xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'
+    + worksheets.join("")
+    + "</Workbook>"
+  );
+}
+
+app.get("/api/risk-matrix", async (_req, res) => {
+  try {
+    const response = await axios.get(`${aiServiceUrl}/api/risk-matrix`);
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch risk matrix", detail: error.message });
+  }
+});
+
+app.post("/api/export/artifacts", async (req, res) => {
+  try {
+    const format = String(req.body?.format || "json").toLowerCase();
+    const artifacts = req.body?.artifacts || {};
+    const testcases = req.body?.testcases || req.body?.data?.testcases || [];
+
+    if (format === "xlsx" || format === "excel") {
+      try {
+        const xlsxResponse = await axios.post(
+          `${aiServiceUrl}/export-artifacts`,
+          { format: "xlsx", artifacts, testcases },
+          { responseType: "arraybuffer" }
+        );
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", "attachment; filename=autotestdesign-artifacts.xlsx");
+        return res.send(Buffer.from(xlsxResponse.data));
+      } catch (_proxyError) {
+        const xml = buildArtifactsSpreadsheetXml(artifacts, testcases);
+        res.setHeader("Content-Type", "application/vnd.ms-excel; charset=utf-8");
+        res.setHeader("Content-Disposition", "attachment; filename=autotestdesign-artifacts.xls");
+        return res.send(xml);
+      }
+    }
+
+    if (format === "csv") {
+      const header = ["id", "designMethod", "title", "priority", "expected", "oracle"];
+      const rows = (Array.isArray(testcases) ? testcases : []).map((item) => (
+        [
+          item.id,
+          item.designMethod,
+          item.title,
+          item.priority,
+          item.expected,
+          item.oracle
+        ]
+          .map((value) => `"${String(value ?? "").replace(/"/g, '""')}"`)
+          .join(",")
+      ));
+      const csv = [header.join(","), ...rows].join("\n");
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", "attachment; filename=autotestdesign-testcases.csv");
+      return res.send(csv);
+    }
+
+    res.json({
+      message: "Artifacts export",
+      artifacts,
+      testcases
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to export artifacts",
+      detail: error.message
+    });
+  }
+});
+
+app.get("/api/engines/info", async (_req, res) => {
+  res.json({
+    message: "Deterministic FR engines",
+    engineVersion: "autotestdesign-engine-v2",
+    promptVersion: "autotestdesign-v6-fr-complete",
+    modules: {
+      "FR 1.0": "requirement_parser.parse_content_blocks",
+      "FR 1.1": "requirement_parser (CSV + numbered text)",
+      "FR 2.0": "risk_engine.score_requirements (impact×likelihood)",
+      "FR 3.0": "blackbox_engine (EP/BVA/DecisionTable/Pairwise)",
+      "FR 4.0": "whitebox_engine (JSON/arrow state model + squat default)",
+      "FR 5.0": "oracle_engine.attach_oracles",
+      "FR 6.0": "export_xlsx + JSON/CSV/Markdown",
+      "FR 7.0": "suite_optimizer.optimize_test_suite",
+      strategies: "strategy_builder (ISO 29119-4)",
+      validation: "schema_validator (LLM JSON)"
+    }
+  });
 });
 
 app.get("/api/export", async (req, res) => {

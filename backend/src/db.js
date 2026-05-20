@@ -30,6 +30,11 @@ export async function ensureSchema() {
       state_model JSONB NOT NULL DEFAULT '{}'::jsonb,
       suite_optimization JSONB NOT NULL DEFAULT '{}'::jsonb,
       traceability JSONB NOT NULL DEFAULT '[]'::jsonb,
+      test_strategies JSONB NOT NULL DEFAULT '[]'::jsonb,
+      engine_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      engine_ms INTEGER NOT NULL DEFAULT 0,
+      llm_ms INTEGER NOT NULL DEFAULT 0,
+      total_ms INTEGER NOT NULL DEFAULT 0,
       quality_score NUMERIC(4,2) NOT NULL DEFAULT 0.00,
       tokens_estimate INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -51,6 +56,11 @@ export async function ensureSchema() {
     ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS state_model JSONB DEFAULT '{}'::jsonb;
     ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS suite_optimization JSONB DEFAULT '{}'::jsonb;
     ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS traceability JSONB DEFAULT '[]'::jsonb;
+    ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS test_strategies JSONB DEFAULT '[]'::jsonb;
+    ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS engine_metadata JSONB DEFAULT '{}'::jsonb;
+    ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS engine_ms INTEGER DEFAULT 0;
+    ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS llm_ms INTEGER DEFAULT 0;
+    ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS total_ms INTEGER DEFAULT 0;
     ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS quality_score NUMERIC(4,2) DEFAULT 0.00;
     ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS tokens_estimate INTEGER DEFAULT 0;
     ALTER TABLE generation_records ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
@@ -95,10 +105,15 @@ export async function insertGenerationRecord(sourceType, sourceSummary, generate
       state_model,
       suite_optimization,
       traceability,
+      test_strategies,
+      engine_metadata,
+      engine_ms,
+      llm_ms,
+      total_ms,
       quality_score,
       tokens_estimate
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
     RETURNING id, source_type, technique, model_name, prompt_version, quality_score, tokens_estimate, created_at
   `;
 
@@ -114,6 +129,12 @@ export async function insertGenerationRecord(sourceType, sourceSummary, generate
   const stateModel = artifacts?.stateModel || {};
   const suiteOptimization = artifacts?.testSuiteOptimization || {};
   const traceability = artifacts?.traceability || [];
+  const testStrategies = artifacts?.testStrategies || [];
+  const engineMetadata = generatedCases?.engineMetadata || artifacts?.engineMetadata || {};
+  const timing = generatedCases?.timingMetrics || artifacts?.timingMetrics || {};
+  const engineMs = Number(timing.engineMs ?? metrics.engineMs ?? 0);
+  const llmMs = Number(timing.llmMs ?? metrics.llmMs ?? 0);
+  const totalMs = Number(timing.totalMs ?? metrics.totalMs ?? engineMs + llmMs);
   const qualityScore = Number(metrics.qualityScore ?? (cases.length >= 3 ? 1.0 : 0.7));
   const tokensEstimate = Number(metrics.tokensEstimate ?? 0);
   const values = [
@@ -131,6 +152,11 @@ export async function insertGenerationRecord(sourceType, sourceSummary, generate
     JSON.stringify(stateModel),
     JSON.stringify(suiteOptimization),
     JSON.stringify(traceability),
+    JSON.stringify(testStrategies),
+    JSON.stringify(engineMetadata),
+    engineMs,
+    llmMs,
+    totalMs,
     qualityScore,
     tokensEstimate
   ];
@@ -156,6 +182,11 @@ export async function getRecentGenerationRecords(limit = 200) {
       state_model,
       suite_optimization,
       traceability,
+      test_strategies,
+      engine_metadata,
+      engine_ms,
+      llm_ms,
+      total_ms,
       quality_score,
       tokens_estimate,
       created_at

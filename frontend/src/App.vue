@@ -24,9 +24,12 @@ const includeOptimization = ref(true);
 const whiteboxDescription = ref("");
 const coverageCriterion = ref("all-states");
 const reviewArtifactsText = ref("");
+const reviewCoverageText = ref("");
+const reviewStrategiesText = ref("");
 const reviewTestcasesText = ref("");
 const reviewTraceabilityText = ref("");
 const reviewError = ref("");
+const reviewViewMode = ref("table");
 const rawIsJson = ref(false);
 const manualRequirementText = ref("");
 const csvRequirementText = ref("");
@@ -142,8 +145,12 @@ function viewHistory(record) {
       riskItems: record.riskItems || [],
       stateModel: record.stateModel || {},
       testSuiteOptimization: record.suiteOptimization || {},
-      traceability: record.traceability || []
+      traceability: record.traceability || [],
+      testStrategies: record.testStrategies || [],
+      engineMetadata: record.engineMetadata || {}
     },
+    engineMetadata: record.engineMetadata || {},
+    timingMetrics: record.timingMetrics || {},
     prompt: {
       version: record.promptVersion || "unknown",
       used: record.promptUsed || ""
@@ -268,6 +275,27 @@ function clearUploadedDocs() {
   status.value = "Cleared uploaded files.";
 }
 
+function parseCsvLine(line) {
+  const values = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (char === "," && !inQuotes) {
+      values.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  values.push(current.trim());
+  return values;
+}
+
 function parseCsvRequirementText(text) {
   const lines = String(text || "")
     .split(/\r?\n/)
@@ -277,11 +305,12 @@ function parseCsvRequirementText(text) {
     return "";
   }
 
-  const headers = lines[0].split(",").map((item) => item.trim());
+  const headers = parseCsvLine(lines[0]);
   const rows = lines.slice(1).map((line, index) => {
-    const values = line.split(",").map((item) => item.trim());
+    const values = parseCsvLine(line);
     const fields = headers.map((header, fieldIndex) => `${header || `field${fieldIndex + 1}`}: ${values[fieldIndex] || "-"}`);
-    return `CSV-REQ-${index + 1}: ${fields.join("; ")}`;
+    const reqId = values[headers.indexOf("id")] || values[0] || `CSV-REQ-${index + 1}`;
+    return `${reqId}: ${fields.join("; ")}`;
   });
   return rows.join("\n");
 }
@@ -298,9 +327,13 @@ function buildManualContent() {
     chunks.push(`[Plain-text requirements]\n${manualText}`);
   }
 
-  const csvText = parseCsvRequirementText(csvRequirementText.value);
-  if (csvText) {
-    chunks.push(`[CSV requirements]\n${csvText}`);
+  const rawCsv = String(csvRequirementText.value || "").trim();
+  if (rawCsv) {
+    chunks.push(`[CSV requirements]\n${rawCsv}`);
+    const csvText = parseCsvRequirementText(csvRequirementText.value);
+    if (csvText) {
+      chunks.push(`[Parsed CSV summary]\n${csvText}`);
+    }
   }
 
   return chunks.join("\n\n");
@@ -373,15 +406,75 @@ async function generateCases() {
   }
 }
 
+function formatCoverageLine(item) {
+  if (item == null) {
+    return "";
+  }
+  if (typeof item === "string") {
+    return item.trim();
+  }
+  if (typeof item === "object") {
+    const label = item.label || item.name || item.id || item.feature || item.coverageItem || item.description;
+    if (label) {
+      return String(label).trim();
+    }
+    return JSON.stringify(item);
+  }
+  return String(item).trim();
+}
+
+function formatCoverageItemsForEditor(items) {
+  return (Array.isArray(items) ? items : [])
+    .map(formatCoverageLine)
+    .filter(Boolean)
+    .join("\n");
+}
+
+function pickNonEmptyArray(primary, fallback) {
+  const chosen = Array.isArray(primary) ? primary : [];
+  return chosen.length ? chosen : (Array.isArray(fallback) ? fallback : []);
+}
+
+function mergeReviewArtifacts(apiArtifacts, parsedArtifacts) {
+  const api = apiArtifacts && typeof apiArtifacts === "object" ? apiArtifacts : {};
+  const parsed = parsedArtifacts && typeof parsedArtifacts === "object" ? parsedArtifacts : {};
+  return {
+    ...api,
+    ...parsed,
+    inputVariables: pickNonEmptyArray(parsed.inputVariables, api.inputVariables),
+    equivalencePartitions: pickNonEmptyArray(parsed.equivalencePartitions, api.equivalencePartitions),
+    boundaryValues: pickNonEmptyArray(parsed.boundaryValues, api.boundaryValues),
+    decisionTableRules: pickNonEmptyArray(parsed.decisionTableRules, api.decisionTableRules),
+    requirementsStructured: pickNonEmptyArray(parsed.requirementsStructured, api.requirementsStructured),
+    coverageItems: pickNonEmptyArray(parsed.coverageItems, api.coverageItems),
+    riskItems: pickNonEmptyArray(parsed.riskItems, api.riskItems),
+    testStrategies: pickNonEmptyArray(parsed.testStrategies, api.testStrategies),
+    traceability: pickNonEmptyArray(parsed.traceability, api.traceability),
+    missingItems: pickNonEmptyArray(parsed.missingItems, api.missingItems),
+    assumptions: pickNonEmptyArray(parsed.assumptions, api.assumptions),
+    stateModel:
+      parsed.stateModel && Object.keys(parsed.stateModel).length
+        ? parsed.stateModel
+        : api.stateModel || {},
+    testSuiteOptimization:
+      parsed.testSuiteOptimization && Object.keys(parsed.testSuiteOptimization).length
+        ? parsed.testSuiteOptimization
+        : api.testSuiteOptimization || {},
+    engineMetadata: api.engineMetadata || parsed.engineMetadata || {},
+    timingMetrics: api.timingMetrics || parsed.timingMetrics || {}
+  };
+}
+
 function syncReviewFromResult() {
   reviewError.value = "";
   const rawText = String(result.value?.llmRawOutput || "").trim();
   const parsed = parseJsonFromText(rawText);
   rawIsJson.value = Boolean(parsed && typeof parsed === "object");
 
-  let artifacts = result.value?.artifacts || result.value?.data?.artifacts || {};
+  const apiArtifacts = result.value?.artifacts || result.value?.data?.artifacts || {};
+  let artifacts = { ...apiArtifacts };
   let testcases = result.value?.data?.testcases || result.value?.testcases || [];
-  let traceability = artifacts?.traceability || [];
+  let traceability = Array.isArray(artifacts?.traceability) ? artifacts.traceability : [];
 
   if (rawIsJson.value) {
     const parsedArtifacts = {
@@ -394,18 +487,20 @@ function syncReviewFromResult() {
       riskItems: parsed?.riskItems || [],
       stateModel: parsed?.stateModel || {},
       testSuiteOptimization: parsed?.testSuiteOptimization || {},
+      testStrategies: parsed?.testStrategies || [],
+      traceability: parsed?.traceability || [],
       missingItems: parsed?.missingItems || [],
       assumptions: parsed?.assumptions || []
     };
 
-    artifacts = parsedArtifacts;
-    testcases = parsed?.testcases || testcases;
-    traceability = parsed?.traceability || [];
+    artifacts = mergeReviewArtifacts(apiArtifacts, parsedArtifacts);
+    testcases = pickNonEmptyArray(parsed?.testcases, testcases);
+    traceability = pickNonEmptyArray(parsed?.traceability, traceability);
+    artifacts.traceability = traceability;
     if (result.value) {
       result.value.artifacts = artifacts;
       result.value.data = result.value.data || {};
       result.value.data.testcases = Array.isArray(testcases) ? testcases : [];
-      result.value.artifacts.traceability = Array.isArray(traceability) ? traceability : [];
       result.value.assignmentCompliance = buildClientAssignmentCompliance(result.value, artifacts, testcases);
     }
   }
@@ -414,10 +509,24 @@ function syncReviewFromResult() {
     result.value.assignmentCompliance = buildClientAssignmentCompliance(result.value, artifacts, testcases);
   }
 
+  const coverage = Array.isArray(artifacts?.coverageItems) ? artifacts.coverageItems : [];
+  const strategies = Array.isArray(artifacts?.testStrategies) ? artifacts.testStrategies : [];
   reviewArtifactsText.value = JSON.stringify(artifacts || {}, null, 2);
+  reviewCoverageText.value = formatCoverageItemsForEditor(coverage);
+  reviewStrategiesText.value = strategies.length ? JSON.stringify(strategies, null, 2) : "[]";
   reviewTestcasesText.value = JSON.stringify(testcases || [], null, 2);
   reviewTraceabilityText.value = JSON.stringify(traceability || [], null, 2);
 }
+
+const reviewTableCases = computed(() => {
+  try {
+    return JSON.parse(reviewTestcasesText.value || "[]");
+  } catch (_error) {
+    return [];
+  }
+});
+
+const timingDisplay = computed(() => result.value?.timingMetrics || result.value?.artifacts?.timingMetrics || null);
 
 function parseJsonFromText(text) {
   if (!text) {
@@ -586,6 +695,7 @@ function extractKeyedJsonFragments(text) {
     "riskItems",
     "stateModel",
     "testSuiteOptimization",
+    "testStrategies",
     "traceability",
     "testcases",
     "testCases",
@@ -661,6 +771,7 @@ function mergeParsedPayloads(items) {
     "riskItems",
     "stateModel",
     "testSuiteOptimization",
+    "testStrategies",
     "traceability",
     "testcases",
     "missingItems",
@@ -727,34 +838,44 @@ function collectDesignMethods(testcases) {
 
 function buildClientAssignmentCompliance(currentResult, artifacts, testcases) {
   const rawOutput = String(currentResult?.llmRawOutput || "");
+  const engineMeta = currentResult?.engineMetadata || artifacts?.engineMetadata || {};
+  const frEngines = engineMeta?.frEngines || {};
   const cases = Array.isArray(testcases) ? testcases : [];
   const traceRefs = cases.flatMap((item) => Array.isArray(item?.traceability) ? item.traceability : []).map((value) => String(value || ""));
   const methods = collectDesignMethods(cases);
   const missingMethods = ["EP", "BVA", "Combinatorial", "StateTransition", "DecisionTable"].filter((method) => !methods.has(method));
+  const hasRuleParser = Boolean(frEngines["FR1.0"] || frEngines["FR1.1"]);
+  const hasRuleRisk = Boolean(frEngines["FR2.0"]);
+  const hasRuleBlackbox = Boolean(frEngines["FR3.0"]);
   const hasStructuredRequirements = (Array.isArray(artifacts?.requirementsStructured) && artifacts.requirementsStructured.length > 0)
+    || hasRuleParser
     || /"requirementsStructured"|REQ-[A-Z0-9-]+|结构化需求/.test(rawOutput);
   const hasRiskItems = (Array.isArray(artifacts?.riskItems) && artifacts.riskItems.length > 0)
+    || hasRuleRisk
     || /"riskItems"|R-[A-Z0-9-]+|风险分析|priority/i.test(rawOutput)
     || cases.some((item) => ["high", "medium", "low"].includes(String(item?.priority || "").toLowerCase()))
     || traceRefs.some((ref) => /^R-/i.test(ref));
+  const hasTestStrategies = (Array.isArray(artifacts?.testStrategies) && artifacts.testStrategies.length > 0) || Boolean(frEngines["FR3.0"]);
   const hasCoverageOrTraceability = (Array.isArray(artifacts?.coverageItems) && artifacts.coverageItems.length > 0)
+    || hasTestStrategies
     || (Array.isArray(artifacts?.traceability) && artifacts.traceability.length > 0)
     || cases.some((item) => Array.isArray(item?.traceability) && item.traceability.length > 0)
     || /"coverageItems"|C-[A-Z0-9-]+|"traceability"|覆盖项|追溯关系/.test(rawOutput);
   const hasStateModel = artifacts?.stateModel && Object.keys(artifacts.stateModel).length > 0;
   const hasOracle = cases.some((item) => String(item?.oracle || "").trim());
   const hasOptimization = artifacts?.testSuiteOptimization && Object.keys(artifacts.testSuiteOptimization).length > 0;
+  const engineNote = engineMeta?.engineVersion ? `Engine ${engineMeta.engineVersion}` : "";
 
   const items = [
-    { id: "FR 1.0", label: "Input/parsing", passed: true, evidence: "Backend accepts content and documents inputs" },
-    { id: "FR 1.1", label: "Requirement structuring", passed: hasStructuredRequirements, evidence: `${artifacts?.requirementsStructured?.length || 0} structured requirements` },
-    { id: "FR 2.0", label: "Risk analysis and priority", passed: hasRiskItems, evidence: `${artifacts?.riskItems?.length || 0} risk items` },
-    { id: "FR 3.0", label: "Black-box test design", passed: methods.size >= 3, evidence: `${methods.size} methods, missing: ${missingMethods.join(", ") || "none"}` },
-    { id: "FR 6.0", label: "Output and export", passed: true, evidence: "Frontend supports Markdown/JSON/CSV; backend supports /api/export" },
-    { id: "Interactive Review", label: "Interactive review", passed: hasCoverageOrTraceability, evidence: "Coverage, risks, cases, and traceability are editable in the UI" },
-    { id: "FR 4.0", label: "White-box modeling", passed: hasStateModel, evidence: hasStateModel ? "State model generated" : "No state model" },
-    { id: "FR 5.0", label: "Test oracle", passed: hasOracle, evidence: hasOracle ? "At least one case has an oracle" : "No oracle" },
-    { id: "FR 7.0", label: "Test suite optimization", passed: hasOptimization, evidence: hasOptimization ? "Optimization generated" : "No optimization" }
+    { id: "FR 1.0", label: "Input/parsing", passed: true, evidence: `Multi-source input; ${engineNote}` },
+    { id: "FR 1.1", label: "Requirement structuring", passed: hasStructuredRequirements, evidence: `${artifacts?.requirementsStructured?.length || 0} reqs; ${frEngines["FR1.1"] || "LLM"}` },
+    { id: "FR 2.0", label: "Risk analysis and priority", passed: hasRiskItems, evidence: `${artifacts?.riskItems?.length || 0} risks; ${frEngines["FR2.0"] || ""}` },
+    { id: "FR 3.0", label: "Black-box test design", passed: methods.size >= 3 || hasRuleBlackbox, evidence: `${methods.size} methods; ${frEngines["FR3.0"] || "LLM"}; missing: ${missingMethods.join(", ") || "none"}` },
+    { id: "FR 6.0", label: "Output and export", passed: true, evidence: "Markdown/JSON/CSV/XLSX export supported" },
+    { id: "Interactive Review", label: "Interactive review", passed: hasCoverageOrTraceability, evidence: "Coverage, strategies, cases, traceability editable" },
+    { id: "FR 4.0", label: "White-box modeling", passed: hasStateModel, evidence: hasStateModel ? `State model; ${frEngines["FR4.0"] || ""}` : "No state model" },
+    { id: "FR 5.0", label: "Test oracle", passed: hasOracle, evidence: hasOracle ? `Oracle present; ${frEngines["FR5.0"] || ""}` : "No oracle" },
+    { id: "FR 7.0", label: "Test suite optimization", passed: hasOptimization, evidence: hasOptimization ? `Optimized; ${frEngines["FR7.0"] || ""}` : "No optimization" }
   ];
   const required = items.filter((item) => !["FR 4.0", "FR 5.0", "FR 7.0"].includes(item.id));
   const requiredPassed = required.filter((item) => item.passed).length;
@@ -782,17 +903,37 @@ function applyReviewEdits() {
     const artifacts = JSON.parse(reviewArtifactsText.value || "{}");
     const testcases = JSON.parse(reviewTestcasesText.value || "[]");
     const traceability = JSON.parse(reviewTraceabilityText.value || "[]");
+    const strategies = JSON.parse(reviewStrategiesText.value || "[]");
+    const coverage = String(reviewCoverageText.value || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    artifacts.coverageItems = coverage;
+    artifacts.testStrategies = Array.isArray(strategies) ? strategies : [];
+    artifacts.traceability = Array.isArray(traceability) ? traceability : [];
     if (!result.value) {
       result.value = { message: "Review changes applied", artifacts, data: { testcases } };
     }
     result.value.artifacts = artifacts;
     result.value.data = result.value.data || {};
     result.value.data.testcases = Array.isArray(testcases) ? testcases : [];
-    result.value.artifacts.traceability = Array.isArray(traceability) ? traceability : [];
     result.value.assignmentCompliance = buildClientAssignmentCompliance(result.value, result.value.artifacts, result.value.data.testcases);
     status.value = "Review changes applied.";
   } catch (error) {
     reviewError.value = `JSON parse failed: ${String(error)}`;
+  }
+}
+
+function updateCaseField(index, field, value) {
+  try {
+    const list = JSON.parse(reviewTestcasesText.value || "[]");
+    if (!Array.isArray(list) || !list[index]) {
+      return;
+    }
+    list[index][field] = value;
+    reviewTestcasesText.value = JSON.stringify(list, null, 2);
+  } catch (_error) {
+    reviewError.value = "Failed to update testcase table.";
   }
 }
 
@@ -848,6 +989,125 @@ function exportCsv() {
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
   status.value = "CSV report exported.";
+}
+
+function buildSpreadsheetXml(artifacts, testcases) {
+  const escapeXml = (value) => String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+  const sheet = (name, headers, rows) => {
+    const headerRow = headers.map((header) => `<Cell><Data ss:Type="String">${escapeXml(header)}</Data></Cell>`).join("");
+    const dataRows = rows.map((row) => {
+      const cells = headers.map((header) => `<Cell><Data ss:Type="String">${escapeXml(row[header])}</Data></Cell>`).join("");
+      return `<Row>${cells}</Row>`;
+    }).join("");
+    return `<Worksheet ss:Name="${escapeXml(name)}"><Table><Row>${headerRow}</Row>${dataRows}</Table></Worksheet>`;
+  };
+
+  const requirements = Array.isArray(artifacts?.requirementsStructured) ? artifacts.requirementsStructured : [];
+  const risks = Array.isArray(artifacts?.riskItems) ? artifacts.riskItems : [];
+  const cases = Array.isArray(testcases) ? testcases : [];
+
+  const reqRows = requirements.map((item) => ({
+    id: item.id || item.reqId || item.requirementId || "",
+    feature: item.feature || item.name || item.title || item.module || "",
+    inputFields: Array.isArray(item.inputFields || item.inputs)
+      ? (item.inputFields || item.inputs).join(";")
+      : String(item.inputFields || item.input || item.inputs || ""),
+    expectedAction: item.expectedAction || item.expected || item.expectedResult || item.description || ""
+  }));
+  const riskRows = risks.map((item) => ({
+    reqId: item.reqId || item.id || item.requirementId || "",
+    impact: item.impact ?? item.Impact ?? "",
+    likelihood: item.likelihood ?? item.Likelihood ?? "",
+    riskScore: item.riskScore ?? item.risk_score ?? item.score ?? "",
+    priority: item.priority || item.Priority || ""
+  }));
+  const caseRows = cases.map((item) => ({
+    id: item.id || item.testCaseId || item.caseId || "",
+    designMethod: item.designMethod || item.method || item.technique || "",
+    title: item.title || item.name || item.summary || "",
+    priority: item.priority || item.severity || "",
+    oracle: item.oracle || "",
+    expected: item.expected || item.expectedResult || item.expected_result || ""
+  }));
+
+  return (
+    '<?xml version="1.0"?><?mso-application progid="Excel.Sheet"?>'
+    + '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">'
+    + sheet("Requirements", ["id", "feature", "inputFields", "expectedAction"], reqRows)
+    + sheet("Risks", ["reqId", "impact", "likelihood", "riskScore", "priority"], riskRows)
+    + sheet("TestCases", ["id", "designMethod", "title", "priority", "oracle", "expected"], caseRows)
+    + "</Workbook>"
+  );
+}
+
+function collectExportPayload() {
+  let artifacts = result.value?.artifacts || result.value?.data?.artifacts || {};
+  let testcases = result.value?.data?.testcases || result.value?.testcases || [];
+
+  try {
+    const parsedArtifacts = JSON.parse(reviewArtifactsText.value || "{}");
+    if (parsedArtifacts && typeof parsedArtifacts === "object" && Object.keys(parsedArtifacts).length) {
+      artifacts = parsedArtifacts;
+    }
+  } catch (_error) {
+    // keep API artifacts
+  }
+
+  try {
+    const parsedCases = JSON.parse(reviewTestcasesText.value || "[]");
+    if (Array.isArray(parsedCases) && parsedCases.length) {
+      testcases = parsedCases;
+    }
+  } catch (_error) {
+    // keep API testcases
+  }
+
+  return { artifacts, testcases };
+}
+
+async function exportXlsx() {
+  if (!result.value) {
+    status.value = "Nothing to export.";
+    return;
+  }
+  const { artifacts, testcases } = collectExportPayload();
+  try {
+    const response = await fetch("http://localhost:3000/api/export/artifacts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ format: "xlsx", artifacts, testcases })
+    });
+    if (!response.ok) {
+      throw new Error("xlsx export failed");
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `autotestdesign-${Date.now()}.xlsx`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    status.value = "Excel (.xlsx) report exported.";
+  } catch (_error) {
+    const xml = buildSpreadsheetXml(artifacts, testcases);
+    const blob = new Blob([xml], { type: "application/vnd.ms-excel;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `autotestdesign-${Date.now()}.xls`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    status.value = "Excel fallback (.xls) exported.";
+  }
 }
 
 function buildReviewedMarkdown() {
@@ -943,12 +1203,14 @@ const reviewSummary = computed(() => {
 
   const risks = Array.isArray(artifacts?.riskItems) ? artifacts.riskItems : [];
   const coverage = Array.isArray(artifacts?.coverageItems) ? artifacts.coverageItems : [];
+  const strategies = Array.isArray(artifacts?.testStrategies) ? artifacts.testStrategies : [];
   const requirements = Array.isArray(artifacts?.requirementsStructured) ? artifacts.requirementsStructured : [];
   const methods = new Set((Array.isArray(testcases) ? testcases : []).map((item) => String(item?.designMethod || "")).filter(Boolean));
 
   return {
     requirements: requirements.length,
     coverage: coverage.length,
+    strategies: strategies.length,
     risks: risks.length,
     testcases: Array.isArray(testcases) ? testcases.length : 0,
     traceability: Array.isArray(traceability) ? traceability.length : 0,
@@ -1199,6 +1461,7 @@ onBeforeUnmount(() => {
             <button class="ghost export-main-btn" v-if="result" @click="exportMarkdown">Export Markdown</button>
             <button class="ghost export-main-btn" v-if="result" @click="exportJson">Export JSON</button>
             <button class="ghost export-main-btn" v-if="result" @click="exportCsv">Export CSV</button>
+            <button class="ghost export-main-btn" v-if="result" @click="exportXlsx">Export Excel</button>
           </div>
         </div>
 
@@ -1238,6 +1501,31 @@ onBeforeUnmount(() => {
               <span>Design Methods</span>
               <strong>{{ reviewSummary.methods }}</strong>
             </div>
+            <div class="metric" v-if="timingDisplay">
+              <span>Engine Time (NFR)</span>
+              <strong>{{ timingDisplay.engineMs }} ms</strong>
+            </div>
+            <div class="metric" v-if="timingDisplay">
+              <span>Total Time</span>
+              <strong>{{ timingDisplay.totalMs }} ms</strong>
+            </div>
+          </div>
+          <p class="msg timing-note" v-if="timingDisplay">
+            Engine {{ timingDisplay.engineMeetsNfr ? "meets" : "exceeds" }} 2s NFR target (LLM adds {{ timingDisplay.llmMs || 0 }} ms).
+          </p>
+
+          <div class="engine-panel" v-if="result.engineMetadata?.engineVersion || result.artifacts?.engineMetadata?.engineVersion">
+            <h3>Deterministic FR Engines</h3>
+            <p class="msg">
+              {{ result.engineMetadata?.engineVersion || result.artifacts?.engineMetadata?.engineVersion }}
+              · {{ result.engineMetadata?.caseCount || result.artifacts?.engineMetadata?.caseCount || 0 }} engine cases
+              · channel: {{ result.engineMetadata?.parseChannel || result.artifacts?.engineMetadata?.parseChannel || "-" }}
+            </p>
+            <ul class="engine-list" v-if="result.engineMetadata?.frEngines || result.artifacts?.engineMetadata?.frEngines">
+              <li v-for="(value, key) in (result.engineMetadata?.frEngines || result.artifacts?.engineMetadata?.frEngines)" :key="key">
+                <b>{{ key }}</b>: {{ value || "—" }}
+              </li>
+            </ul>
           </div>
 
           <div class="assignment-panel" v-if="result.assignmentCompliance?.items?.length">
@@ -1273,15 +1561,55 @@ onBeforeUnmount(() => {
           <details class="collapsible" v-if="hasArtifacts" open>
             <summary>Structured Artifacts and Risks</summary>
             <label>
-              artifacts
-              <textarea v-model="reviewArtifactsText" rows="10"></textarea>
+              artifacts (JSON)
+              <textarea v-model="reviewArtifactsText" rows="8"></textarea>
+            </label>
+          </details>
+
+          <details class="collapsible" v-if="hasArtifacts" open>
+            <summary>Coverage Items (one per line)</summary>
+            <label>
+              coverageItems
+              <textarea v-model="reviewCoverageText" rows="5" placeholder="姿态分析接口&#10;状态迁移"></textarea>
+            </label>
+          </details>
+
+          <details class="collapsible" v-if="hasArtifacts" open>
+            <summary>Test Strategies (ISO 29119-4 mapping)</summary>
+            <label>
+              testStrategies (JSON)
+              <textarea v-model="reviewStrategiesText" rows="6"></textarea>
             </label>
           </details>
 
           <details class="collapsible" v-if="hasTestcases" open>
-            <summary>Test Cases</summary>
-            <label>
-              testcases
+            <summary>Test Cases (table + JSON)</summary>
+            <div class="review-toggle">
+              <button class="ghost" :class="{ active: reviewViewMode === 'table' }" @click="reviewViewMode = 'table'">Table</button>
+              <button class="ghost" :class="{ active: reviewViewMode === 'json' }" @click="reviewViewMode = 'json'">JSON</button>
+            </div>
+            <div class="case-table-wrap" v-if="reviewViewMode === 'table' && reviewTableCases.length">
+              <table class="case-table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Method</th>
+                    <th>Title</th>
+                    <th>Priority</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row, index) in reviewTableCases" :key="row.id || index">
+                    <td><input :value="row.id" @input="updateCaseField(index, 'id', $event.target.value)" /></td>
+                    <td><input :value="row.designMethod" @input="updateCaseField(index, 'designMethod', $event.target.value)" /></td>
+                    <td><input :value="row.title" @input="updateCaseField(index, 'title', $event.target.value)" /></td>
+                    <td><input :value="row.priority" @input="updateCaseField(index, 'priority', $event.target.value)" /></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <label v-show="reviewViewMode === 'json'">
+              testcases (JSON)
               <textarea v-model="reviewTestcasesText" rows="10"></textarea>
             </label>
           </details>

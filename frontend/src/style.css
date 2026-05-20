@@ -201,6 +201,76 @@ h1 {
   font-weight: 700;
 }
 
+.engine-panel {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(15, 155, 142, 0.06);
+}
+
+.engine-panel h3 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+}
+
+.engine-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.engine-list li {
+  margin-bottom: 4px;
+}
+
+.timing-note {
+  margin: 0 0 10px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.review-toggle {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.review-toggle .ghost.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.case-table-wrap {
+  overflow: auto;
+  max-height: 280px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.case-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.case-table th,
+.case-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.case-table input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font: inherit;
+}
+
 .assignment-panel {
   border: 1px solid rgba(45, 124, 246, 0.2);
   border-radius: 12px;
