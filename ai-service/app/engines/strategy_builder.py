@@ -29,11 +29,17 @@ METHOD_META = {
     },
 }
 
+METHOD_META["WhiteBoxJava"] = {
+    "name": "Java White-Box Testing",
+    "isoRef": "Statement and branch coverage",
+    "description": "Analyze Java method control flow and generate statement/branch coverage sequences.",
+}
+
 
 def build_test_strategies(
     requirements: List[Dict[str, Any]],
     testcases: List[Dict[str, Any]],
-    coverage_items: List[str],
+    coverage_items: List[Any],
 ) -> List[Dict[str, Any]]:
     strategies: List[Dict[str, Any]] = []
     methods_present = sorted(
@@ -58,11 +64,17 @@ def build_test_strategies(
                 "name": meta["name"],
                 "isoRef": meta["isoRef"],
                 "description": meta["description"],
-                "coverageItems": [item for item in coverage_items if method.lower() in item.lower()][:5]
+                "coverageItems": [item for item in coverage_items if method.lower() in _coverage_text(item).lower()][:5]
                 or coverage_items[:2],
                 "linkedRequirements": linked_reqs,
                 "linkedTestcases": linked,
-                "rationale": f"Selected for FitnessAI requirements using {method} per assignment scope.",
+                "rationale": f"Selected based on the structured requirements using {method} per the test design scope.",
             }
         )
     return strategies
+
+
+def _coverage_text(item: Any) -> str:
+    if isinstance(item, dict):
+        return " ".join(str(item.get(key, "")) for key in ("id", "type", "target", "methodId", "methodName"))
+    return str(item)

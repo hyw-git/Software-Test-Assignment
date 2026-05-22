@@ -12,10 +12,18 @@ const port = Number(process.env.PORT || 3000);
 const aiServiceUrl = process.env.AI_SERVICE_URL || "http://localhost:8000";
 const targetApplication = {
   name: "FitnessAI",
+  description: "Intelligent fitness assistant covering pose analysis, state-machine repetition counting, training plans, record filtering, and dashboard analytics.",
+  focusModules: ["Pose analysis API", "State-machine counting", "Training plan", "Record filtering", "Dashboard analytics"],
+  assignmentScope: "Risk analysis, test plan, and detailed test design are all scoped to the FitnessAI target application."
+};
+/*
+const targetApplication = {
+  name: "FitnessAI",
   description: "基于姿态识别、状态机计数、训练计划和数据统计的智能健身辅助系统",
   focusModules: ["姿态分析接口", "状态机计数", "训练计划", "记录过滤", "仪表盘统计"],
   assignmentScope: "风险分析报告、测试计划和详细测试设计均面向 FitnessAI 目标应用"
 };
+*/
 const requiredMethods = [
   "EP",
   "BVA",
@@ -24,6 +32,31 @@ const requiredMethods = [
   "DecisionTable"
 ];
 
+function isWhiteBoxJavaCase(item) {
+  return String(item?.designMethod || "").trim() === "WhiteBoxJava"
+    || String(item?.technique || "").trim() === "white-box";
+}
+
+function normalizeDesignMethods(item) {
+  const text = [
+    item?.designMethod,
+    item?.method,
+    item?.technique,
+    item?.title,
+    item?.id,
+    ...(Array.isArray(item?.traceability) ? item.traceability : [])
+  ].map((value) => String(value || "")).join(" ");
+  const methods = new Set();
+
+  if (/\bEP\b|equivalence/i.test(text)) methods.add("EP");
+  if (/\bBVA\b|boundary/i.test(text)) methods.add("BVA");
+  if (/combinatorial|pairwise/i.test(text)) methods.add("Combinatorial");
+  if (/state\s*transition|stateTransition/i.test(text)) methods.add("StateTransition");
+  if (/decision\s*table|decisionTable/i.test(text)) methods.add("DecisionTable");
+
+  return methods;
+}
+/*
 function normalizeDesignMethods(item) {
   const text = [
     item?.designMethod,
@@ -44,6 +77,7 @@ function normalizeDesignMethods(item) {
   return methods;
 }
 
+*/
 function collectDesignMethods(cases) {
   const methods = new Set();
   for (const item of Array.isArray(cases) ? cases : []) {
@@ -56,24 +90,40 @@ function collectDesignMethods(cases) {
 
 function analyzeBlackBoxQuality(cases) {
   const caseList = Array.isArray(cases) ? cases : [];
-  const methodsPresent = collectDesignMethods(caseList);
+  const whiteboxCases = caseList.filter(isWhiteBoxJavaCase);
+  const blackboxCases = caseList.filter((item) => !isWhiteBoxJavaCase(item));
+  if (!blackboxCases.length && whiteboxCases.length) {
+    return {
+      caseCount: whiteboxCases.length,
+      whiteboxCaseCount: whiteboxCases.length,
+      methodCoverage: 1,
+      coveredMethods: ["WhiteBoxJava"],
+      missingMethods: [],
+      priorityStats: { high: 0, medium: whiteboxCases.length, low: 0 },
+      qualityScore: 1,
+      recommendations: ["WhiteBoxJava design generated; black-box method coverage is not evaluated for this white-box run."]
+    };
+  }
+
+  const methodsPresent = collectDesignMethods(blackboxCases);
   const missingMethods = requiredMethods.filter((method) => !methodsPresent.has(method));
 
   const methodCoverage = requiredMethods.length === 0
     ? 0
     : (requiredMethods.length - missingMethods.length) / requiredMethods.length;
 
-  const highCount = caseList.filter((item) => String(item?.priority || "").toLowerCase() === "high").length;
-  const mediumCount = caseList.filter((item) => String(item?.priority || "").toLowerCase() === "medium").length;
-  const lowCount = caseList.filter((item) => String(item?.priority || "").toLowerCase() === "low").length;
+  const highCount = blackboxCases.filter((item) => String(item?.priority || "").toLowerCase() === "high").length;
+  const mediumCount = blackboxCases.filter((item) => String(item?.priority || "").toLowerCase() === "medium").length;
+  const lowCount = blackboxCases.filter((item) => String(item?.priority || "").toLowerCase() === "low").length;
 
-  const amountScore = Math.min(caseList.length / 8, 1);
-  const priorityBalance = caseList.length > 0 ? Math.min((highCount + mediumCount * 0.7 + lowCount * 0.4) / caseList.length, 1) : 0;
+  const amountScore = Math.min(blackboxCases.length / 8, 1);
+  const priorityBalance = blackboxCases.length > 0 ? Math.min((highCount + mediumCount * 0.7 + lowCount * 0.4) / blackboxCases.length, 1) : 0;
 
   const qualityScore = Number((methodCoverage * 0.6 + amountScore * 0.2 + priorityBalance * 0.2).toFixed(2));
 
   return {
-    caseCount: caseList.length,
+    caseCount: blackboxCases.length,
+    whiteboxCaseCount: whiteboxCases.length,
     methodCoverage: Number(methodCoverage.toFixed(2)),
     coveredMethods: requiredMethods.filter((method) => methodsPresent.has(method)),
     missingMethods,
@@ -225,12 +275,18 @@ app.post("/api/testcases/generate", async (req, res) => {
       promptMode = "default",
       customPrompt = "",
       documents = [],
+      requirementsStructured = [],
+      riskItems = [],
       testTechnique = process.env.TEST_TECHNIQUE || "black-box",
       includeWhitebox = true,
       includeOracle = true,
       includeOptimization = true,
       whiteboxDescription = "",
-      coverageCriterion = "all-states"
+      coverageCriterion = "all-states",
+      selectedTechniques = [],
+      techniquePrompts = {},
+      reviewerOverrides = {},
+      reviewer_overrides = {}
     } = req.body || {};
 
     if (!["requirements", "codebase"].includes(sourceType)) {
@@ -241,9 +297,10 @@ app.post("/api/testcases/generate", async (req, res) => {
 
     const hasContent = Boolean(String(content).trim());
     const hasDocuments = Array.isArray(documents) && documents.some((item) => String(item?.content || "").trim());
-    if (!hasContent && !hasDocuments) {
+    const hasWhiteboxDescription = Boolean(String(whiteboxDescription).trim());
+    if (!hasContent && !hasDocuments && !hasWhiteboxDescription) {
       return res.status(400).json({
-        message: "content or documents must not be empty"
+        message: "content, documents, or whiteboxDescription must not be empty"
       });
     }
 
@@ -253,12 +310,17 @@ app.post("/api/testcases/generate", async (req, res) => {
       promptMode,
       customPrompt,
       documents,
+      requirementsStructured,
+      riskItems,
       testTechnique,
       includeWhitebox,
       includeOracle,
       includeOptimization,
       whiteboxDescription,
-      coverageCriterion
+      coverageCriterion,
+      selectedTechniques,
+      techniquePrompts,
+      reviewerOverrides: Object.keys(reviewerOverrides || {}).length ? reviewerOverrides : reviewer_overrides
     });
 
     const generated = aiResponse.data;
@@ -267,7 +329,7 @@ app.post("/api/testcases/generate", async (req, res) => {
       : "";
     const sourceSummary = String(content).trim()
       ? String(content).slice(0, 500)
-      : `files: ${summaryFromDocs}`.slice(0, 500);
+      : (String(whiteboxDescription).trim() ? String(whiteboxDescription).slice(0, 500) : `files: ${summaryFromDocs}`.slice(0, 500));
     const quality = analyzeBlackBoxQuality(generated?.testcases || []);
     const assignmentCompliance = buildAssignmentCompliance(generated, quality);
     const timing = generated?.timingMetrics || generated?.artifacts?.timingMetrics || {};
@@ -305,6 +367,54 @@ app.post("/api/testcases/generate", async (req, res) => {
     const upstreamDetail = error?.response?.data?.detail || error?.response?.data?.message;
     res.status(500).json({
       message: "Failed to generate test cases",
+      detail: upstreamDetail || error.message
+    });
+  }
+});
+
+app.post("/api/qra", async (req, res) => {
+  try {
+    const {
+      sourceType = "requirements",
+      content = "",
+      documents = []
+    } = req.body || {};
+
+    if (!["requirements", "codebase"].includes(sourceType)) {
+      return res.status(400).json({
+        message: "sourceType must be requirements or codebase"
+      });
+    }
+
+    const hasContent = Boolean(String(content).trim());
+    const hasDocuments = Array.isArray(documents) && documents.some((item) => String(item?.content || "").trim());
+    if (!hasContent && !hasDocuments) {
+      return res.status(400).json({
+        message: "content or documents must not be empty"
+      });
+    }
+
+    const aiResponse = await axios.post(`${aiServiceUrl}/qra`, {
+      sourceType,
+      content,
+      documents
+    });
+
+    const data = aiResponse.data || {};
+    res.json({
+      message: "QRA complete",
+      artifacts: {
+        requirementsStructured: data.requirementsStructured || [],
+        riskItems: data.riskItems || []
+      },
+      engineMetadata: data.engineMetadata || {},
+      timingMetrics: data.timingMetrics || {},
+      data
+    });
+  } catch (error) {
+    const upstreamDetail = error?.response?.data?.detail || error?.response?.data?.message;
+    res.status(500).json({
+      message: "Failed to run QRA",
       detail: upstreamDetail || error.message
     });
   }
@@ -551,8 +661,8 @@ app.get("/api/engines/info", async (_req, res) => {
       "FR 1.0": "requirement_parser.parse_content_blocks",
       "FR 1.1": "requirement_parser (CSV + numbered text)",
       "FR 2.0": "risk_engine.score_requirements (impact×likelihood)",
-      "FR 3.0": "blackbox_engine (EP/BVA/DecisionTable/Pairwise)",
-      "FR 4.0": "whitebox_engine (JSON/arrow state model + squat default)",
+      "FR 3.0": "generation_pipeline + blackbox_workers (EP/BVA/DecisionTable/Pairwise/StateTransition)",
+      "FR 4.0": "WhiteBoxJava CFG analyzer + state_model_engine fallback",
       "FR 5.0": "oracle_engine.attach_oracles",
       "FR 6.0": "export_xlsx + JSON/CSV/Markdown",
       "FR 7.0": "suite_optimizer.optimize_test_suite",

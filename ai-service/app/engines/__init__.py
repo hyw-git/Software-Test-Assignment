@@ -1,3 +1,3 @@
-from .pipeline import run_deterministic_pipeline, merge_engine_with_llm
+from .generation_pipeline import run_generation_pipeline
 
-__all__ = ["run_deterministic_pipeline", "merge_engine_with_llm"]
+__all__ = ["run_generation_pipeline"]

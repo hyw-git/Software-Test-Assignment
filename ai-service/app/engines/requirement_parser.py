@@ -55,17 +55,20 @@ def _infer_ranges(input_text: str, condition_text: str) -> Dict[str, Any]:
     if "landmark" in combined or "关键点" in combined:
         ranges["landmarks.length"] = {"min": 32, "nominal": 33, "max": 34}
 
-    count_match = re.search(r"count\s*<\s*(\d+)", combined)
-    duration_match = re.search(r"duration\w*\s*<\s*(\d+)", combined)
+    # 提取数值边界：存为整数，供 generate_bva_cases 三点法使用
+    # 支持格式：count < 3, count>=3, count=3, count boundary = 3
+    count_match = re.search(r"count\s*(?:<|>=?|=|boundary\s*=)\s*(\d+)", combined)
+    duration_match = re.search(r"duration\w*\s*(?:<|>=?|=|boundary\s*=)\s*(\d+)", combined)
     if count_match or duration_match:
-        ranges["count"] = f"<{count_match.group(1) if count_match else '3'}"
-        ranges["durationSeconds"] = f"<{duration_match.group(1) if duration_match else '30'}"
+        ranges["count"] = int(count_match.group(1)) if count_match else 3
+        ranges["durationSeconds"] = int(duration_match.group(1)) if duration_match else 30
 
     enum_match = re.findall(r"([A-Z_]{3,})", input_text)
     if enum_match:
         ranges["enum"] = sorted(set(enum_match))
 
     return ranges
+
 
 
 def parse_numbered_requirements(text: str) -> List[Dict[str, Any]]:
@@ -163,7 +166,9 @@ def parse_content_blocks(content: str) -> Tuple[List[Dict[str, Any]], str]:
     inline_csv = re.search(r"^id,feature,input,condition,expected", content, re.I | re.M)
     if inline_csv:
         start = inline_csv.start()
-        csv_text = content[start:]
+        tail = content[start:]
+        section_break = re.search(r"\n\[", tail)
+        csv_text = tail[:section_break.start()] if section_break else tail
         for item in parse_csv_requirements(csv_text):
             if item["id"] not in seen_ids:
                 seen_ids.add(item["id"])

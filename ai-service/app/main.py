@@ -15,12 +15,20 @@ try:
 except Exception:  # pragma: no cover
     OpenAI = None
 
-from app.engines.pipeline import merge_engine_with_llm, run_deterministic_pipeline
-from app.engines.risk_engine import export_risk_matrix
+from app.engines.generation_pipeline import (
+    ALL_TECHNIQUES,
+    GlobalContext,
+    PIPELINE_VERSION,
+    run_generation_pipeline,
+)
+from app.engines.requirement_parser import parse_content_blocks
+from app.engines.risk_engine import export_risk_matrix, score_requirements
 from app.engines.schema_validator import validate_llm_payload
 from app.export_xlsx import build_xlsx_bytes
 
 app = FastAPI(title="AI Testcase Service")
+
+ENGINE_VERSION = "autotestdesign-engine-v3"
 
 
 class GenerateRequest(BaseModel):
@@ -30,11 +38,30 @@ class GenerateRequest(BaseModel):
     promptMode: str = "default"
     customPrompt: str = ""
     documents: List[Dict[str, str]] = []
+    requirementsStructured: List[Dict[str, Any]] = []
+    riskItems: List[Dict[str, Any]] = []
     includeWhitebox: bool = False
     includeOracle: bool = False
     includeOptimization: bool = False
     whiteboxDescription: str = ""
     coverageCriterion: str = "all-states"
+    selectedTechniques: List[str] = Field(default_factory=list)
+    techniquePrompts: Dict[str, str] = Field(default_factory=dict)
+    reviewerOverrides: Dict[str, Any] = Field(default_factory=dict)
+    reviewer_overrides: Dict[str, Any] = Field(default_factory=dict)
+
+
+class QraRequest(BaseModel):
+    sourceType: str = "requirements"
+    content: str = ""
+    documents: List[Dict[str, str]] = []
+
+
+class QraResponse(BaseModel):
+    requirementsStructured: List[Dict[str, Any]] = Field(default_factory=list)
+    riskItems: List[Dict[str, Any]] = Field(default_factory=list)
+    engineMetadata: Dict[str, Any] = Field(default_factory=dict)
+    timingMetrics: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TestCase(BaseModel):
@@ -49,6 +76,15 @@ class TestCase(BaseModel):
     oracle: str = ""
     priority: str
     traceability: List[str] = []
+    sequenceId: str = ""
+    coverageTargets: List[str] = Field(default_factory=list)
+    pathConstraints: List[str] = Field(default_factory=list)
+    setup: str = ""
+    setupHints: List[str] = Field(default_factory=list)
+    constraintConflicts: List[str] = Field(default_factory=list)
+    exceptionTriggerHints: List[Dict[str, Any]] = Field(default_factory=list)
+    oracleHints: Dict[str, Any] = Field(default_factory=dict)
+    needsReview: bool = False
 
 
 class TestArtifacts(BaseModel):
@@ -59,12 +95,17 @@ class TestArtifacts(BaseModel):
     missingItems: List[str] = Field(default_factory=list)
     assumptions: List[str] = Field(default_factory=list)
     requirementsStructured: List[Dict[str, Any]] = Field(default_factory=list)
-    coverageItems: List[str] = Field(default_factory=list)
+    coverageItems: List[Any] = Field(default_factory=list)
     riskItems: List[Dict[str, Any]] = Field(default_factory=list)
     stateModel: Dict[str, Any] = Field(default_factory=dict)
     testSuiteOptimization: Dict[str, Any] = Field(default_factory=dict)
     traceability: List[Dict[str, Any]] = Field(default_factory=list)
     testStrategies: List[Dict[str, Any]] = Field(default_factory=list)
+    whiteboxAnalysis: Dict[str, Any] = Field(default_factory=dict)
+    testSequences: List[Dict[str, Any]] = Field(default_factory=list)
+    llmEnhancedTestcases: List[Dict[str, Any]] = Field(default_factory=list)
+    llmReadyWhiteboxContext: Dict[str, Any] = Field(default_factory=dict)
+    warnings: List[str] = Field(default_factory=list)
     engineMetadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -91,6 +132,7 @@ ALLOWED_METHODS = [
     "Combinatorial",
     "StateTransition",
     "DecisionTable",
+    "WhiteBoxJava",
 ]
 
 PROMPT_VERSION = "autotestdesign-v6-fr-complete"
@@ -564,11 +606,12 @@ def _normalize_cases(payload, source_type: str) -> List[TestCase]:
         method = str(item.get("designMethod", "EP")).strip()
         if method not in ALLOWED_METHODS:
             method = "EP"
+        technique = "white-box" if method == "WhiteBoxJava" or str(item.get("technique", "")).strip() == "white-box" else "black-box"
 
         normalized.append(
             TestCase(
                 id=str(item.get("id", f"TC-BB-{i:03d}")),
-                technique="black-box",
+                technique=technique,
                 designMethod=method,
                 title=str(item.get("title", f"黑盒测试用例 {i}")),
                 precondition=str(item.get("precondition", "系统已启动并接口可访问")),
@@ -578,6 +621,15 @@ def _normalize_cases(payload, source_type: str) -> List[TestCase]:
                 oracle=str(item.get("oracle", "")),
                 priority=str(item.get("priority", "medium")),
                 traceability=[str(value) for value in item.get("traceability", []) if str(value).strip()],
+                sequenceId=str(item.get("sequenceId", "")),
+                coverageTargets=[str(value) for value in item.get("coverageTargets", []) if str(value).strip()],
+                pathConstraints=[str(value) for value in item.get("pathConstraints", []) if str(value).strip()],
+                setup=str(item.get("setup", "")),
+                setupHints=[str(value) for value in item.get("setupHints", []) if str(value).strip()],
+                constraintConflicts=[str(value) for value in item.get("constraintConflicts", []) if str(value).strip()],
+                exceptionTriggerHints=[value for value in item.get("exceptionTriggerHints", []) if isinstance(value, dict)],
+                oracleHints=item.get("oracleHints", {}) if isinstance(item.get("oracleHints", {}), dict) else {},
+                needsReview=bool(item.get("needsReview", False)),
             )
         )
 
@@ -659,14 +711,64 @@ def _normalize_artifacts(payload) -> TestArtifacts:
         missingItems=missing_items,
         assumptions=assumptions,
         requirementsStructured=_safe_list("requirementsStructured"),
-        coverageItems=[str(item) for item in _safe_list("coverageItems") if str(item).strip()],
+        coverageItems=[item for item in _safe_list("coverageItems") if isinstance(item, dict) or str(item).strip()],
         riskItems=_safe_list("riskItems"),
         stateModel=payload.get("stateModel", {}) if isinstance(payload.get("stateModel", {}), dict) else {},
         testSuiteOptimization=payload.get("testSuiteOptimization", {}) if isinstance(payload.get("testSuiteOptimization", {}), dict) else {},
         traceability=_normalize_traceability(_safe_list("traceability")),
         testStrategies=_safe_list("testStrategies"),
+        whiteboxAnalysis=payload.get("whiteboxAnalysis", {}) if isinstance(payload.get("whiteboxAnalysis", {}), dict) else {},
+        testSequences=_safe_list("testSequences"),
+        llmEnhancedTestcases=_safe_list("llmEnhancedTestcases"),
+        llmReadyWhiteboxContext=payload.get("llmReadyWhiteboxContext", {}) if isinstance(payload.get("llmReadyWhiteboxContext", {}), dict) else {},
+        warnings=[str(item) for item in _safe_list("warnings") if str(item).strip()],
         engineMetadata=payload.get("engineMetadata", {}) if isinstance(payload.get("engineMetadata", {}), dict) else {},
     )
+
+
+def _priority_rank(value: str) -> int:
+    normalized = str(value or "").strip().lower()
+    return {"low": 0, "medium": 1, "high": 2}.get(normalized, -1)
+
+
+def _apply_risk_priorities(cases: List[TestCase], risk_items: List[Dict[str, Any]]) -> List[TestCase]:
+    if not cases:
+        return cases
+    risk_map = {
+        str(item.get("reqId", "")): str(item.get("priority", "")).lower()
+        for item in (risk_items or [])
+        if str(item.get("reqId", "")).strip()
+    }
+    if not risk_map:
+        return cases
+
+    for case in cases:
+        traceability = [str(value) for value in (case.traceability or []) if str(value).strip()]
+        if not traceability:
+            continue
+        best_priority = None
+        best_rank = -1
+        for ref in traceability:
+            priority = risk_map.get(ref)
+            if not priority:
+                continue
+            rank = _priority_rank(priority)
+            if rank > best_rank:
+                best_rank = rank
+                best_priority = priority
+        if best_priority:
+            case.priority = best_priority
+    return cases
+
+
+def _normalize_selected_techniques(values: List[str] | None) -> List[str]:
+    allowed = set(ALL_TECHNIQUES)
+    selected: List[str] = []
+    for value in values or []:
+        technique = str(value or "").strip()
+        if technique in allowed and technique not in selected:
+            selected.append(technique)
+    return selected or [technique for technique in ALL_TECHNIQUES if technique != "WhiteBoxJava"]
 
 
 def _has_artifact_content(artifacts: TestArtifacts) -> bool:
@@ -685,6 +787,11 @@ def _has_artifact_content(artifacts: TestArtifacts) -> bool:
             artifacts.testSuiteOptimization,
             artifacts.traceability,
             artifacts.testStrategies,
+            artifacts.whiteboxAnalysis,
+            artifacts.testSequences,
+            artifacts.llmEnhancedTestcases,
+            artifacts.llmReadyWhiteboxContext,
+            artifacts.warnings,
         ]
     )
 
@@ -1113,45 +1220,59 @@ def _finalize_generation(
     whitebox_description: str = "",
     llm_ms: int = 0,
     llm_validation: Dict[str, Any] | None = None,
+    requirements_override: List[Dict[str, Any]] | None = None,
+    risk_items_override: List[Dict[str, Any]] | None = None,
+    selected_techniques: List[str] | None = None,
+    technique_prompts: Dict[str, str] | None = None,
+    reviewer_overrides: Dict[str, Any] | None = None,
 ) -> GenerateResponse:
-    engine = run_deterministic_pipeline(
-        merged_content,
-        include_whitebox=include_whitebox,
-        include_oracle=include_oracle,
-        include_optimization=include_optimization,
+    requirements = requirements_override if requirements_override else parse_content_blocks(merged_content)[0]
+    risks = risk_items_override if risk_items_override else score_requirements(requirements)
+    techniques = _normalize_selected_techniques(selected_techniques)
+
+    ctx = GlobalContext.from_pipeline_kwargs(
+        requirements=requirements,
+        risk_items=risks,
         coverage_criterion=coverage_criterion,
         whitebox_description=whitebox_description,
+        optimization_mode="risk-first",
+        sourceType=source_type,
+        sourceContent=merged_content,
+        promptUsed=prompt_used,
+        globalPrompt=prompt_used,
+        techniquePrompts=technique_prompts or {},
+        reviewerOverrides=reviewer_overrides or {},
+        reviewer_overrides=reviewer_overrides or {},
     )
-    llm_artifact_dict = llm_artifacts if isinstance(llm_artifacts, dict) else {}
-    llm_case_dicts = [item.model_dump() if hasattr(item, "model_dump") else dict(item) for item in llm_cases]
-    merged_artifacts, merged_case_dicts = merge_engine_with_llm(engine, llm_artifact_dict, llm_case_dicts)
-    merged_cases = _normalize_cases(merged_case_dicts, source_type)
-    meta = merged_artifacts.get("engineMetadata", engine.get("engineMetadata", {}))
+    engine = run_generation_pipeline(
+        ctx,
+        techniques,
+        include_oracle=include_oracle,
+        include_optimization=include_optimization,
+    )
+
+    merged_artifacts = dict(engine)
+    merged_cases = _normalize_cases(engine.get("testcases", []), source_type)
+    meta = dict(engine.get("engineMetadata", {}))
     if llm_validation:
         meta["llmValidation"] = llm_validation
+    meta.setdefault("pipelineVersion", PIPELINE_VERSION)
+    meta.setdefault("selectedTechniques", techniques)
     merged_artifacts["engineMetadata"] = meta
-    engine_ms = int(meta.get("engineMs") or engine.get("timingMetrics", {}).get("engineMs") or 0)
-    total_ms = engine_ms + int(llm_ms or 0)
-    timing = {
-        "engineMs": engine_ms,
-        "llmMs": int(llm_ms or 0),
-        "totalMs": total_ms,
-        "engineMeetsNfr": engine_ms <= 2000,
-        "note": "NFR target 2s applies to deterministic engine; LLM adds variable latency.",
-    }
+    timing = dict(engine.get("timingMetrics", {}))
+    timing.setdefault("engineMs", int(meta.get("engineMs") or 0))
+    timing.setdefault("llmMs", int(llm_ms or 0))
+    timing.setdefault("totalMs", int(timing.get("engineMs", 0)) + int(timing.get("llmMs", 0)))
+    timing.setdefault("engineMeetsNfr", int(timing.get("engineMs", 0)) <= 2000)
+    timing.setdefault("note", "Generation pipeline dispatches selected black-box workers; worker LLM latency is included in engine time.")
     merged_artifacts["timingMetrics"] = timing
     artifacts = _normalize_artifacts(merged_artifacts)
-    if include_oracle:
-        from app.engines.oracle_engine import attach_oracles
-
-        case_dicts = [c.model_dump() for c in merged_cases]
-        enriched = attach_oracles(case_dicts, merged_artifacts.get("requirementsStructured", []))
-        merged_cases = _normalize_cases(enriched, source_type)
+    merged_cases = _apply_risk_priorities(merged_cases, merged_artifacts.get("riskItems", []))
 
     return GenerateResponse(
         model=model,
-        testTechnique="black-box",
-        promptVersion=PROMPT_VERSION,
+        testTechnique="white-box" if techniques == ["WhiteBoxJava"] else "black-box",
+        promptVersion=PIPELINE_VERSION,
         promptUsed=prompt_used,
         llmRawOutput=llm_raw or _cases_to_markdown(merged_cases),
         artifacts=artifacts,
@@ -1175,14 +1296,23 @@ def _mock_response(
     include_optimization = bool(req.includeOptimization) if req is not None else True
     coverage = str(req.coverageCriterion if req else "all-states")
     wb = str(req.whiteboxDescription if req else "")
+    reviewed_requirements = req.requirementsStructured if req and isinstance(req.requirementsStructured, list) else []
+    reviewed_risks = req.riskItems if req and isinstance(req.riskItems, list) else []
+    selected = req.selectedTechniques if req and isinstance(req.selectedTechniques, list) else []
+    technique_prompts = req.techniquePrompts if req and isinstance(req.techniquePrompts, dict) else {}
+    reviewer_overrides = {}
+    if req is not None:
+        reviewer_overrides = req.reviewerOverrides if isinstance(req.reviewerOverrides, dict) else {}
+        if not reviewer_overrides and isinstance(req.reviewer_overrides, dict):
+            reviewer_overrides = req.reviewer_overrides
     return _finalize_generation(
         source_type,
         merged_content,
-        "mock+engine",
+        os.getenv("OPENAI_MODEL", "generation-pipeline").strip() or "generation-pipeline",
         reason,
-        _cases_to_markdown(mock_cases),
-        artifact_dict,
-        mock_cases,
+        "",
+        {},
+        [],
         include_whitebox,
         include_oracle,
         include_optimization,
@@ -1190,6 +1320,11 @@ def _mock_response(
         wb,
         0,
         {"passed": True, "source": "mock"},
+        reviewed_requirements,
+        reviewed_risks,
+        selected,
+        technique_prompts,
+        reviewer_overrides,
     )
 
 
@@ -1233,25 +1368,32 @@ def generate_testcases(req: GenerateRequest):
     include_oracle = bool(req.includeOracle)
     include_optimization = bool(req.includeOptimization)
     coverage_criterion = str(req.coverageCriterion or "all-states")
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    reviewed_requirements = req.requirementsStructured if isinstance(req.requirementsStructured, list) else []
+    reviewed_risks = req.riskItems if isinstance(req.riskItems, list) else []
     model = os.getenv("OPENAI_MODEL", "deepseek-chat").strip()
+    selected = _normalize_selected_techniques(req.selectedTechniques)
+    technique_prompts = {
+        str(key): str(value)
+        for key, value in (req.techniquePrompts or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    reviewer_overrides = req.reviewerOverrides if isinstance(req.reviewerOverrides, dict) else {}
+    if not reviewer_overrides and isinstance(req.reviewer_overrides, dict):
+        reviewer_overrides = req.reviewer_overrides
 
-    if not api_key or OpenAI is None:
-        return _mock_response(req.sourceType, merged_content, "mock-fallback:no-api-key", req)
-
-    base_url = os.getenv("OPENAI_BASE_URL", "").strip()
-    if base_url:
-        client = OpenAI(api_key=api_key, base_url=base_url)
-    else:
-        client = OpenAI(api_key=api_key)
-
-    prompt = build_prompt(
-        req.sourceType,
-        merged_content,
-        prompt_mode=str(req.promptMode or "default"),
-        custom_prompt=str(req.customPrompt or ""),
+    prompt = (
+        "Generation pipeline request\n"
+        f"sourceType={req.sourceType}\n"
+        f"selectedTechniques={selected}\n"
+        f"promptMode={str(req.promptMode or 'default')}\n"
+        f"customPrompt={str(req.customPrompt or '')[:1000]}"
     )
+    if reviewed_requirements:
+        prompt += "\n\nReviewed structured requirements (authoritative):\n"
+        prompt += json.dumps(reviewed_requirements, ensure_ascii=False, indent=2)[:3000]
+    if reviewed_risks:
+        prompt += "\n\nReviewed risk items (authoritative, use for testcase priorities):\n"
+        prompt += json.dumps(reviewed_risks, ensure_ascii=False, indent=2)[:3000]
     if req.includeWhitebox or req.includeOracle or req.includeOptimization:
         prompt += (
             "\n\nAdditional requirements:\n"
@@ -1262,47 +1404,62 @@ def generate_testcases(req: GenerateRequest):
             f"- coverageCriterion: {str(req.coverageCriterion)}\n"
         )
 
-    llm_started = time.perf_counter()
-    try:
-        response = _call_llm(client, model, prompt)
-        text = _extract_response_text(response)
-    except Exception as error:
-        if os.getenv("DISABLE_LLM_FAILURE_FALLBACK", "false").strip().lower() != "true":
-            return _mock_response(req.sourceType, merged_content, f"mock-fallback:llm-request-failed:{error}", req)
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {error}")
-
-    if not text:
-        if os.getenv("DISABLE_LLM_FAILURE_FALLBACK", "false").strip().lower() != "true":
-            return _mock_response(req.sourceType, merged_content, "mock-fallback:llm-empty-content", req)
-        raise HTTPException(status_code=502, detail="LLM returned empty content")
-
-    llm_ms = int((time.perf_counter() - llm_started) * 1000)
-    payload = _extract_json_object(text) or {}
-    llm_valid, llm_issues = validate_llm_payload(payload if isinstance(payload, dict) else {})
-    llm_validation = {"passed": llm_valid, "issues": llm_issues, "source": "schema_validator"}
-    cases = _normalize_cases(payload.get("testcases", []), req.sourceType)
-    artifacts = _normalize_artifacts(payload)
-    if not cases and ENABLE_PARSE_FALLBACK:
-        cases = _mock_cases(req.sourceType, merged_content)
-    artifact_dict = artifacts.model_dump() if hasattr(artifacts, "model_dump") else {}
-    if not _has_artifact_content(artifacts) and ENABLE_PARSE_FALLBACK:
-        artifact_dict = _mock_artifacts(merged_content).model_dump()
-
-    rendered_raw = _cases_to_markdown(cases) if ENABLE_PARSE_FALLBACK and not _extract_json_object(text) else text
-
     return _finalize_generation(
         req.sourceType,
         merged_content,
         model,
         prompt,
-        rendered_raw,
-        artifact_dict,
-        cases,
+        "",
+        {},
+        [],
         include_whitebox,
         include_oracle,
         include_optimization,
         coverage_criterion,
         str(req.whiteboxDescription or ""),
-        llm_ms,
-        llm_validation,
+        0,
+        {"passed": True, "source": "generation_pipeline", "selectedTechniques": selected},
+        reviewed_requirements,
+        reviewed_risks,
+        selected,
+        technique_prompts,
+        reviewer_overrides,
+    )
+
+
+@app.post("/qra", response_model=QraResponse)
+def generate_qra(req: QraRequest):
+    merged_content = _compose_content(req.content, req.documents)
+    if not merged_content.strip():
+        raise HTTPException(status_code=400, detail="content or documents must not be empty")
+
+    started = time.perf_counter()
+    requirements, parse_channel = parse_content_blocks(merged_content)
+    risks = score_requirements(requirements)
+    engine_ms = int((time.perf_counter() - started) * 1000)
+
+    engine_metadata = {
+        "engineVersion": ENGINE_VERSION,
+        "parseChannel": parse_channel,
+        "engineMs": engine_ms,
+        "requirementCount": len(requirements),
+        "riskCount": len(risks),
+        "frEngines": {
+            "FR1.0": "requirement_parser.parse_content_blocks",
+            "FR1.1": "requirement_parser (CSV RFC + numbered text)",
+            "FR2.0": "risk_engine.score_requirements + risk_config",
+        },
+    }
+    timing = {
+        "engineMs": engine_ms,
+        "totalMs": engine_ms,
+        "engineMeetsNfr": engine_ms <= 2000,
+        "note": "QRA uses the deterministic engine only.",
+    }
+
+    return QraResponse(
+        requirementsStructured=requirements,
+        riskItems=risks,
+        engineMetadata=engine_metadata,
+        timingMetrics=timing,
     )

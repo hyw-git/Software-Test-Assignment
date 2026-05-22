@@ -7,7 +7,7 @@ REQUIRED_ARTIFACT_KEYS = (
     "testcases",
 )
 
-ALLOWED_METHODS = {"EP", "BVA", "Combinatorial", "StateTransition", "DecisionTable"}
+ALLOWED_METHODS = {"EP", "BVA", "Combinatorial", "StateTransition", "DecisionTable", "WhiteBoxJava"}
 
 
 def validate_llm_payload(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
